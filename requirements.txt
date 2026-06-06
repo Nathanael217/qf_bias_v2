@@ -1,0 +1,24 @@
+# QF_BIAS — Python dependencies
+# Versi dikunci seminim mungkin: hanya batas bawah yang kritis.
+# Update via: pip install --upgrade -r requirements.txt
+
+# --- Dashboard ---
+streamlit>=1.32.0          # st.cache_data + st.columns modern
+
+# --- HTTP & parsing ---
+requests>=2.31.0
+feedparser>=6.0.10         # collectors/news.py — FinancialJuice RSS
+beautifulsoup4>=4.12.0     # collectors/retail.py — FXSSI/Dukascopy scrape (graceful)
+lxml>=5.1.0                # backend parser cepat untuk BeautifulSoup
+
+# --- Market data ---
+yfinance>=0.2.40           # collectors/prices.py — FX/Gold/DXY (Yahoo). WAJIB (dipakai prices.py)
+ccxt>=4.3.0                # collectors/prices.py — Bybit crypto OHLCV (public)
+
+# --- Data & numerik ---
+pandas>=2.1.0              # DataFrame untuk COT, macro, sliding window
+numpy>=1.26.0              # collectors/prices.py — ATR vektor (dipakai eksplisit)
+python-dateutil>=2.9.0     # parsing timestamp fleksibel (FRED & CFTC)
+
+# CATATAN: tidak pakai pytz — timeutils.py pakai zoneinfo (stdlib, Python 3.9+).
+# Streamlit Cloud = Python 3.11+, jadi zoneinfo selalu tersedia.
