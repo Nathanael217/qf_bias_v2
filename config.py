@@ -92,6 +92,69 @@ Bobot per faktor scoring. SUM = 1.0.
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, "WEIGHTS harus sum = 1.0"
 
 # ---------------------------------------------------------------------------
+# TRADE PROFILES — PLACEHOLDER, BELUM TERVALIDASI
+# ---------------------------------------------------------------------------
+
+TRADE_PROFILES: dict[str, dict] = {
+    "session": {
+        "label": "Session (2-6 jam)",
+        "weights":  {"R_hard": 0.12, "C": 0.08, "D": 0.30, "F": 0.50},  # PLACEHOLDER
+        "carry":    {"deadband_pp": 2.0},                                  # PLACEHOLDER
+        "cot":      {"extreme": (10, 90), "freshness_tau": 3.0, "freshness_floor": 0.0},  # PLACEHOLDER
+        "retail":   {"extreme_hi": 65, "shape": "convex"},                 # PLACEHOLDER
+        "surprise": {"impact_min": "medium", "freshness_tau": 1.0},       # PLACEHOLDER
+    },
+    "intraday": {
+        "label": "Intraday (8-12 jam)",
+        "weights":  {"R_hard": 0.22, "C": 0.13, "D": 0.25, "F": 0.40},  # PLACEHOLDER
+        "carry":    {"deadband_pp": 1.5},                                  # PLACEHOLDER
+        "cot":      {"extreme": (12, 88), "freshness_tau": 4.0, "freshness_floor": 0.10},  # PLACEHOLDER
+        "retail":   {"extreme_hi": 68, "shape": "convex"},                 # PLACEHOLDER
+        "surprise": {"impact_min": "medium", "freshness_tau": 1.5},       # PLACEHOLDER
+    },
+    "swing": {
+        "label": "Swing (2-3 hari)",
+        "weights":  {"R_hard": 0.35, "C": 0.25, "D": 0.18, "F": 0.22},  # PLACEHOLDER
+        "carry":    {"deadband_pp": 0.5},                                  # PLACEHOLDER
+        "cot":      {"extreme": (25, 75), "freshness_tau": 6.0, "freshness_floor": 0.25},  # PLACEHOLDER
+        "retail":   {"extreme_hi": 75, "shape": "linear"},                 # PLACEHOLDER
+        "surprise": {"impact_min": "high", "freshness_tau": 2.0},         # PLACEHOLDER
+    },
+    "swing_weekly": {
+        "label": "Swing Weekly (1-2 minggu)",
+        "weights":  {"R_hard": 0.45, "C": 0.30, "D": 0.13, "F": 0.12},  # PLACEHOLDER
+        "carry":    {"deadband_pp": 0.0},                                  # PLACEHOLDER
+        "cot":      {"continuous": True, "freshness_tau": 8.0, "freshness_floor": 0.25},  # PLACEHOLDER
+        "retail":   {"extreme_hi": 80, "shape": "linear"},                 # PLACEHOLDER
+        "surprise": {"impact_min": "high", "freshness_tau": 1.5},         # PLACEHOLDER
+    },
+}
+"""
+Profil bobot + gating per tipe trade. Pilihan di sidebar app.py.
+
+Empat profil: session (scalp), intraday, swing, swing_weekly.
+Setiap profil mengatur:
+  - weights   : bobot 4 faktor (R_hard, C, D, F). WAJIB sum == 1.0.
+  - carry     : deadband carry (pp); diff < deadband → R_hard = 0.
+  - cot       : extreme gate / continuous, freshness tau/floor.
+  - retail    : extreme_hi threshold, shape magnitude (linear/convex).
+  - surprise  : impact_min gate, freshness tau.
+
+⚠ SEMUA NILAI = PLACEHOLDER. Validasi via backtest sebelum sizing nyata.
+  Lihat arsitektur §0 Prinsip 9.
+"""
+
+DEFAULT_PROFILE: str = "swing"
+"""Profil tipe trade default yang dipilih saat app pertama kali dibuka."""
+
+# Assert: tiap profil weights harus sum == 1.0 (toleransi 1e-9)
+for _pname, _pdata in TRADE_PROFILES.items():
+    _wsum = sum(_pdata["weights"].values())
+    assert abs(_wsum - 1.0) < 1e-9, (
+        f"TRADE_PROFILES['{_pname}']['weights'] sum = {_wsum} ≠ 1.0"
+    )
+
+# ---------------------------------------------------------------------------
 # GATING THRESHOLDS — PLACEHOLDER, BELUM TERVALIDASI
 # ---------------------------------------------------------------------------
 
