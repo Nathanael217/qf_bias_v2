@@ -27,6 +27,9 @@ def cot_freshness(
     days_since_snapshot: float,
     price_change: float,
     atr14: float,
+    *,
+    tau: float = FRESHNESS_TAU,
+    floor: float = FRESHNESS_FLOOR,
 ) -> float:
     """Hitung freshness multiplier COT untuk digunakan di score_C.
 
@@ -44,27 +47,34 @@ def cot_freshness(
         Average True Range 14 periode dari prices collector.
         Dipakai sebagai baseline volatilitas untuk mengukur signifikansi price_change.
         Kalau 0 atau negatif (data hilang), penalty divergence diabaikan.
+    tau : float, keyword-only
+        Time-constant (hari) untuk decay eksponensial. Default = FRESHNESS_TAU (6.0).
+        PLACEHOLDER — bisa di-override per profil tipe trade.
+    floor : float, keyword-only
+        Batas bawah freshness multiplier. Default = FRESHNESS_FLOOR (0.25).
+        PLACEHOLDER — bisa di-override per profil tipe trade.
 
     Returns
     -------
     float
-        Freshness multiplier ∈ [FRESHNESS_FLOOR, 1.0].
-        Nilai 1.0 = data sangat segar. FRESHNESS_FLOOR = minimum (tidak pernah nol).
+        Freshness multiplier ∈ [floor, 1.0].
+        Nilai 1.0 = data sangat segar. floor = minimum (tidak pernah nol).
 
     Notes
     -----
-    - τ (FRESHNESS_TAU) = 6 hari → PLACEHOLDER.
-    - FRESHNESS_FLOOR = 0.25 → PLACEHOLDER.
+    - τ (tau) default = FRESHNESS_TAU (6 hari) → PLACEHOLDER.
+    - floor default = FRESHNESS_FLOOR (0.25) → PLACEHOLDER.
     - ATR_DIVERGENCE_K = 1.5 → PLACEHOLDER.
     - Penalty divergence bersifat binary (×0.5 kalau lewat threshold),
       bukan kontinyu — sesuai spesifikasi arsitektur v1.
+    - Default tau/floor identik dengan versi sebelumnya → backward-compatible.
     """
     # 1. Decay eksponensial sejak hari ke-3 (hari rilis normal COT = Jumat = t≈3)
     t = max(0.0, float(days_since_snapshot))
-    raw_freshness = math.exp(-(t - 3.0) / FRESHNESS_TAU)
+    raw_freshness = math.exp(-(t - 3.0) / tau)
 
-    # Clamp ke [FLOOR, 1.0]
-    freshness = max(FRESHNESS_FLOOR, min(1.0, raw_freshness))
+    # Clamp ke [floor, 1.0]
+    freshness = max(floor, min(1.0, raw_freshness))
 
     # 2. Penalty divergence harga
     if atr14 > 0.0:
@@ -77,7 +87,7 @@ def cot_freshness(
                 ATR_DIVERGENCE_K,
                 atr14,
             )
-            freshness = max(FRESHNESS_FLOOR, freshness * 0.5)
+            freshness = max(floor, freshness * 0.5)
     else:
         logger.debug(
             "atr14=%.5f ≤ 0 — divergence penalty dilewati (data hilang).",
@@ -85,8 +95,10 @@ def cot_freshness(
         )
 
     logger.debug(
-        "cot_freshness: t=%.1f days → raw=%.4f → final=%.4f",
+        "cot_freshness: t=%.1f days, tau=%.1f, floor=%.2f → raw=%.4f → final=%.4f",
         t,
+        tau,
+        floor,
         raw_freshness,
         freshness,
     )
@@ -117,3 +129,9 @@ if __name__ == "__main__":
     for days, chg, atr14, note in cases:
         f = cot_freshness(days, chg, atr14)
         print(f"{days:>5} {chg:>9.5f} {atr14:>8.5f} {f:>10.4f}  {note}")
+
+    print("\n--- Test tau/floor override ---")
+    f1 = cot_freshness(6, 0.00050, 0.0060, tau=3.0, floor=0.0)
+    f2 = cot_freshness(6, 0.00050, 0.0060, tau=6.0, floor=0.25)
+    print(f"tau=3.0 floor=0.0  → {f1:.4f}")
+    print(f"tau=6.0 floor=0.25 → {f2:.4f} (default)")
