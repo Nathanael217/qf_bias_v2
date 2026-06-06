@@ -4,7 +4,7 @@ Formula (disetujui user):
     poin_event = z × polaritas × bobot_impact × freshness
     z          = (actual − forecast) / σ_event   (σ + polaritas dari sigma_table)
     bobot_impact = high 1.0 / medium 0.5 / low 0.15
-    freshness  = exp(−hari_sejak_rilis / 1.5)     (hari ini≈1, 2hr≈0.26 → "priced in")
+    freshness  = exp(−hari_sejak_rilis / tau)     (hari ini≈1, 2hr≈0.26 → "priced in")
 Skor currency = clamp(Σ poin_event × SCALE, −1, +1).
 
 Waktu FF sumber = UTC−5 (empiris: ADP 7:15am scraper = 8:15 ET; NFP 7:30am = 8:30 ET)
@@ -23,9 +23,33 @@ from utils.timeutils import parse_iso_utc
 _IMPACT_W = {"high": 1.0, "medium": 0.5, "low": 0.15, "holiday": 0.0, "": 0.0}
 _FF_SCALE = 0.5          # PLACEHOLDER — skala poin→[-1,1]
 _Z_CLAMP = 3.0
-_FRESH_TAU_DAYS = 1.5    # PLACEHOLDER — decay freshness (hari)
+_FRESH_TAU_DAYS = 1.5    # PLACEHOLDER — decay freshness default (hari)
 _SRC_OFFSET_H = -5       # TZ sumber scraper FF (empiris UTC−5)
 _WIB_OFFSET_H = 7
+
+# Rank impact untuk filtering per-profil
+_IMPACT_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
+
+
+def _passes_impact(impact_str: str, impact_min: str) -> bool:
+    """Cek apakah event lolos filter impact minimum.
+
+    Parameters
+    ----------
+    impact_str : str
+        Nilai impact event (mis. "high", "medium", "low", "holiday", "").
+    impact_min : str
+        Minimum impact yang diterima (mis. "low", "medium", "high").
+
+    Returns
+    -------
+    bool
+        True kalau rank(impact_str) >= rank(impact_min).
+        Impact tak dikenal / kosong → False.
+    """
+    rank_event = _IMPACT_RANK.get((impact_str or "").lower(), 0)
+    rank_min = _IMPACT_RANK.get((impact_min or "low").lower(), 1)
+    return rank_event >= rank_min and rank_event > 0
 
 
 def _parse_num(s: Any) -> float | None:
@@ -85,8 +109,29 @@ def _now_wib_naive(now: Any = None) -> datetime:
     return (datetime.utcnow() + timedelta(hours=_WIB_OFFSET_H))
 
 
-def score_event(e: dict, now_wib: datetime | None = None) -> dict | None:
-    """Skor satu event FF. None kalau bukan surprise terukur (belum rilis / tak ada σ / impact 0)."""
+def score_event(
+    e: dict,
+    now_wib: datetime | None = None,
+    *,
+    impact_min: str = "low",
+    tau: float = _FRESH_TAU_DAYS,
+) -> dict | None:
+    """Skor satu event FF. None kalau bukan surprise terukur (belum rilis / tak ada σ / impact 0).
+
+    Parameters
+    ----------
+    e : dict
+        Satu row event ForexFactory (format scraper).
+    now_wib : datetime | None
+        Waktu referensi WIB (opsional; untuk test deterministik).
+    impact_min : str, keyword-only
+        Minimum impact yang diterima. "low" (default) → lolos semua impact bertanda.
+        "medium" → skip low-impact. "high" → skip medium & low. Default "low" →
+        perilaku tak berubah (backward compat).
+    tau : float, keyword-only
+        Freshness decay constant (hari). Default = _FRESH_TAU_DAYS (1.5) →
+        perilaku tak berubah. PLACEHOLDER — di-override per profil.
+    """
     now = _now_wib_naive(now_wib)
     ccy = (e.get("currency") or "").upper()
     actual = _parse_num(e.get("actual"))
@@ -96,16 +141,23 @@ def score_event(e: dict, now_wib: datetime | None = None) -> dict | None:
     sigma, polarity = sigma_polarity(e.get("name", ""), ccy)
     if sigma is None or polarity is None or sigma == 0:
         return None
-    impact_w = _IMPACT_W.get((e.get("impact") or "").lower(), 0.0)
+
+    impact_str = (e.get("impact") or "").lower()
+    # Filter impact minimum
+    if not _passes_impact(impact_str, impact_min):
+        return None
+
+    impact_w = _IMPACT_W.get(impact_str, 0.0)
     if impact_w == 0.0:
         return None
+
     z = max(-_Z_CLAMP, min(_Z_CLAMP, (actual - forecast) / sigma))
     wib = to_wib(e.get("date", ""), e.get("time", ""), now.year)
     if wib is not None:
         days_ago = max(0.0, (now - wib).total_seconds() / 86400.0)
     else:
         days_ago = 1.0
-    fresh = math.exp(-days_ago / _FRESH_TAU_DAYS)
+    fresh = math.exp(-days_ago / tau)
     pts = z * polarity * impact_w * fresh
     return {
         "ccy": ccy, "points": round(pts, 4), "z": round(z, 2),
@@ -151,17 +203,39 @@ def _aggregate_scored(items: list[dict]) -> dict[str, dict]:
     return out
 
 
-def compute_ff_surprise(ff_events: list[dict], now: Any = None) -> dict[str, dict]:
+def compute_ff_surprise(
+    ff_events: list[dict],
+    now: Any = None,
+    *,
+    impact_min: str = "low",
+    tau: float = _FRESH_TAU_DAYS,
+) -> dict[str, dict]:
     """Agregasi per currency dari event hasil scrape ForexFactory (format string).
+
     now = datetime/date WIB (opsional). Return {CCY:{score,detail,n}}.
     Group anti-double-count = (date|time) baris kalender. Lihat _aggregate_scored.
+
+    JANGAN ubah agregasi max-per-timestamp (_aggregate_scored) — itu fix #2.
+
+    Parameters
+    ----------
+    ff_events : list[dict]
+        List event FF dari scraper (format string: date/time/actual/forecast).
+    now : Any
+        Waktu referensi WIB (opsional).
+    impact_min : str, keyword-only
+        Minimum impact yang lolos scoring. Default "low" → backward compat.
+        PLACEHOLDER — di-override dari active_profile["surprise"]["impact_min"].
+    tau : float, keyword-only
+        Freshness decay constant (hari). Default _FRESH_TAU_DAYS (1.5) → backward compat.
+        PLACEHOLDER — di-override dari active_profile["surprise"]["freshness_tau"].
     """
     now_wib = _now_wib_naive(now)
     items: list[dict] = []
     for e in ff_events or []:
         if not isinstance(e, dict):
             continue
-        sc = score_event(e, now_wib)
+        sc = score_event(e, now_wib, impact_min=impact_min, tau=tau)
         if sc is None:
             continue
         items.append({
@@ -185,12 +259,30 @@ def _days_ago_from_iso(ts_iso: str, now_utc_dt: datetime | None) -> float:
         return 1.0
 
 
-def _score_calendar_event(e: dict, now_utc_dt: datetime | None) -> dict | None:
+def _score_calendar_event(
+    e: dict,
+    now_utc_dt: datetime | None,
+    *,
+    impact_min: str = "low",
+    tau: float = _FRESH_TAU_DAYS,
+) -> dict | None:
     """Skor satu released-event kalender faireconomy (sudah float bersih + ter-enrich σ).
 
     Beda dari score_event (yg parse string FF): input di sini sudah
     actual/forecast float, ts_utc ISO, dan historical_std + surprise_polarity
     dari engine/sigma_table. None kalau bukan surprise terukur.
+
+    Parameters
+    ----------
+    e : dict
+        Event kalender yang sudah di-enrich (actual/forecast float, ts_utc ISO,
+        historical_std, surprise_polarity).
+    now_utc_dt : datetime | None
+        Waktu referensi UTC (opsional; untuk test deterministik).
+    impact_min : str, keyword-only
+        Minimum impact. Default "low" → backward compat.
+    tau : float, keyword-only
+        Freshness decay constant. Default _FRESH_TAU_DAYS → backward compat.
     """
     ccy = (e.get("currency") or "").upper()
     actual = e.get("actual")
@@ -207,13 +299,20 @@ def _score_calendar_event(e: dict, now_utc_dt: datetime | None) -> dict | None:
         return None
     if sigma_f == 0.0:
         return None
-    impact_w = _IMPACT_W.get((e.get("impact") or "").lower(), 0.0)
+
+    impact_str = (e.get("impact") or "").lower()
+    # Filter impact minimum
+    if not _passes_impact(impact_str, impact_min):
+        return None
+
+    impact_w = _IMPACT_W.get(impact_str, 0.0)
     if impact_w == 0.0:
         return None
+
     z = max(-_Z_CLAMP, min(_Z_CLAMP, (float(actual) - float(forecast)) / sigma_f))
     ts = e.get("ts_utc") or ""
     days_ago = _days_ago_from_iso(ts, now_utc_dt)
-    fresh = math.exp(-days_ago / _FRESH_TAU_DAYS)
+    fresh = math.exp(-days_ago / tau)
     pts = z * float(polarity) * impact_w * fresh
     return {
         "ccy": ccy, "points": round(pts, 4), "z": round(z, 2),
@@ -224,7 +323,11 @@ def _score_calendar_event(e: dict, now_utc_dt: datetime | None) -> dict | None:
 
 
 def compute_ff_surprise_from_calendar(
-    released_events: list[dict], now: Any = None
+    released_events: list[dict],
+    now: Any = None,
+    *,
+    impact_min: str = "low",
+    tau: float = _FRESH_TAU_DAYS,
 ) -> dict[str, dict]:
     """Faktor F OTOMATIS dari kalender faireconomy — jalur default (tanpa scrape manual).
 
@@ -233,13 +336,28 @@ def compute_ff_surprise_from_calendar(
     sudah ter-set di surprise_polarity. Return {CCY:{score,detail,n}}.
 
     now = datetime UTC opsional (default: sekarang) — untuk test deterministik.
+
+    JANGAN ubah agregasi max-per-timestamp (_aggregate_scored) — itu fix #2.
+
+    Parameters
+    ----------
+    released_events : list[dict]
+        Event kalender yang sudah di-enrich.
+    now : Any
+        Waktu referensi UTC (opsional).
+    impact_min : str, keyword-only
+        Minimum impact. Default "low" → backward compat.
+        PLACEHOLDER — di-override dari active_profile["surprise"]["impact_min"].
+    tau : float, keyword-only
+        Freshness decay constant (hari). Default _FRESH_TAU_DAYS → backward compat.
+        PLACEHOLDER — di-override dari active_profile["surprise"]["freshness_tau"].
     """
     now_utc_dt = now if isinstance(now, datetime) else None
     items: list[dict] = []
     for e in released_events or []:
         if not isinstance(e, dict):
             continue
-        sc = _score_calendar_event(e, now_utc_dt)
+        sc = _score_calendar_event(e, now_utc_dt, impact_min=impact_min, tau=tau)
         if sc is None:
             continue
         items.append(sc)
