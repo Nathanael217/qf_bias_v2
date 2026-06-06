@@ -2,8 +2,8 @@
 engine/scoring.py — Per-Asset Bias Scoring
 
 Mengimplementasikan §3 Scoring Spec dari arsitektur QF_BIAS:
-  - score_R_hard  : Makro (surprise z-score + rate differential), kontinu [-1,1].
-  - score_C       : COT (cot_index percentile), EKSTREM-ONLY, freshness-weighted.
+  - score_R_hard  : Makro (rate differential murni / carry), kontinu [-1,1].
+  - score_C       : COT (cot_index percentile), EKSTREM-ONLY atau kontinu, freshness-weighted.
   - score_D       : Retail sentiment, KONTRARIAN, EKSTREM-ONLY.
   - compute_asset_bias : Driver dict + bias_baseline via weighted-sum renormalisasi.
   - compute_all_assets : Loop semua aset (FX + XAU + Crypto).
@@ -99,7 +99,12 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 # score_R_hard
 # ---------------------------------------------------------------------------
 
-def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
+def score_R_hard(
+    macro: dict[str, Any],
+    asset: str,
+    *,
+    carry_deadband_pp: float = 0.0,
+) -> tuple[float, str]:
     """Hitung sub-skor R_hard (CARRY) untuk satu asset/currency.
 
     R_hard = rate differential murni (selisih suku bunga kebijakan).
@@ -120,6 +125,10 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
         Output dari collectors/macro.py sesuai schema §4.
     asset : str
         Currency/aset (mis. "USD", "EUR", "XAU", "BTC").
+    carry_deadband_pp : float, keyword-only
+        Deadband carry (percentage points). Kalau |avg_diff| < carry_deadband_pp
+        → return (0.0, detail_deadband). Default 0.0 → perilaku tak berubah (backward compat).
+        PLACEHOLDER — di-set per profil tipe trade.
 
     Returns
     -------
@@ -155,6 +164,18 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
 
     if count_diff > 0:
         avg_diff = acc_diff / count_diff
+
+        # --- Deadband carry: kalau diff terlalu kecil → anggap nol (noise) ---
+        if carry_deadband_pp > 0.0 and abs(avg_diff) < carry_deadband_pp:
+            detail = (
+                f"carry {avg_diff:+.2f}pp < deadband {carry_deadband_pp} -> 0"
+            )
+            logger.debug(
+                "score_R_hard[%s]: deadband aktif: avg_diff=%.2f < %.2f → 0",
+                asset, avg_diff, carry_deadband_pp,
+            )
+            return 0.0, detail
+
         diff_clamped = _clamp(avg_diff, -_RHARD_DIFF_MAX, _RHARD_DIFF_MAX)
         diff_norm = diff_clamped / _RHARD_DIFF_MAX
         diff_detail = f"rate diff avg={avg_diff:.2f}pp"
@@ -178,22 +199,31 @@ def score_C(
     cot: dict[str, Any],
     asset: str,
     freshness: float,
+    *,
+    extreme: tuple[int, int] = COT_EXTREME,
+    continuous: bool = False,
 ) -> tuple[float, str]:
     """Hitung sub-skor C (COT) untuk satu asset/currency.
 
-    Gating: COT Index (percentile 0–100) harus berada di LUAR COT_EXTREME = (20, 80).
-    Di antara 20–80 → skor = 0 (tidak berkontribusi).
+    Mode default (continuous=False):
+      Gating: COT Index (percentile 0–100) harus berada di LUAR `extreme` = (lower, upper).
+      Di antara lower–upper → skor = 0 (tidak berkontribusi).
+
+    Mode kontinu (continuous=True):
+      ABAIKAN gate ekstrem. raw = clamp((cot_idx - 50)/50, -1, 1).
+      idx 100→+1, 0→-1, 50→0. Tanda FOLLOWING (sama seperti default).
+      Berguna untuk swing weekly di mana setiap deviasi dari netral dihitung.
 
     Konvensi tanda (FOLLOWING per v1 — arsitektur §3.1):
-      cot_index > 80 (net spec LONG ekstrem) → C positif (bullish lean).
-      cot_index < 20 (net spec SHORT ekstrem) → C negatif (bearish lean).
+      cot_index > 50 (lebih banyak spec LONG) → C positif (bullish lean).
+      cot_index < 50 (lebih banyak spec SHORT) → C negatif (bearish lean).
       ⚠ OPEN: apakah harusnya CONTRARIAN di ekstrem (exhaustion)?
         Biarkan following + tandai placeholder. Jangan flip tanpa backtest.
 
-    Magnitude di ekstrem:
+    Magnitude di ekstrem (mode default, continuous=False):
       Skala linear dari threshold ke batas (0 atau 100):
-        upper: cot_index dari 80 → 100 di-map ke 0 → +1
-        lower: cot_index dari 20 → 0  di-map ke 0 → -1
+        upper: cot_index dari upper → 100 di-map ke 0 → +1
+        lower: cot_index dari lower → 0  di-map ke 0 → -1
 
     Freshness: skor efektif = skor_raw × freshness.
     (Bobot efektif w_C = w_C_nominal × freshness, diterapkan di compute_asset_bias
@@ -207,15 +237,21 @@ def score_C(
     asset : str
         Currency/aset.
     freshness : float
-        Multiplier dari cot_freshness(), ∈ [FRESHNESS_FLOOR, 1.0].
+        Multiplier dari cot_freshness(), ∈ [floor, 1.0].
+    extreme : tuple[int, int], keyword-only
+        (lower, upper) percentile COT untuk gating. Default = COT_EXTREME (20,80).
+        Di-override per profil tipe trade. Hanya berlaku bila continuous=False.
+        PLACEHOLDER.
+    continuous : bool, keyword-only
+        Jika True: mode kontinu (abaikan gate ekstrem, pakai formula linear penuh).
+        Default False → perilaku tak berubah (backward compat).
+        PLACEHOLDER — swing_weekly mengaktifkan ini.
 
     Returns
     -------
     (score, detail_str)
-        score ∈ [-1, 1] (sudah di-scale freshness), detail untuk display.
+        score ∈ [-1, 1] (raw, sebelum freshness ke bobot), detail untuk display.
     """
-    cot_lower, cot_upper = COT_EXTREME  # (20, 80)
-
     cot_data: dict | None = _safe_get(cot, "cot", asset, default=None)
     if cot_data is None:
         logger.debug("score_C[%s]: tidak ada data COT", asset)
@@ -228,6 +264,22 @@ def score_C(
 
     cot_idx = float(idx_raw)
 
+    # --- Mode kontinu: abaikan gate ekstrem, formula linear penuh ---
+    if continuous:
+        raw_score = _clamp((cot_idx - 50.0) / 50.0, -1.0, 1.0)
+        detail = (
+            f"COT index {cot_idx:.1f} → kontinu; raw={raw_score:.3f} "
+            f"(freshness {freshness:.3f} diterapkan ke BOBOT)"
+        )
+        logger.debug(
+            "score_C[%s]: kontinu idx=%.1f → raw=%.3f (fresh→weight=%.3f)",
+            asset, cot_idx, raw_score, freshness,
+        )
+        return raw_score, detail
+
+    # --- Mode default: gating ekstrem ---
+    cot_lower, cot_upper = extreme  # default (20, 80) dari COT_EXTREME
+
     # Gating
     if cot_lower <= cot_idx <= cot_upper:
         detail = f"COT index {cot_idx:.1f} (tdk ekstrem, {cot_lower}–{cot_upper}) → 0"
@@ -235,11 +287,11 @@ def score_C(
 
     # Magnitude scale di ekstrem
     if cot_idx > cot_upper:
-        # Bullish ekstrem: 80→100 di-map ke 0→+1
+        # Bullish ekstrem: upper→100 di-map ke 0→+1
         raw_score = (cot_idx - cot_upper) / (100.0 - cot_upper)
         sign_str = "bullish (following)"
     else:
-        # Bearish ekstrem: 20→0 di-map ke 0→-1
+        # Bearish ekstrem: lower→0 di-map ke 0→-1
         raw_score = -((cot_lower - cot_idx) / (cot_lower - 0.0))
         sign_str = "bearish (following)"
 
@@ -253,7 +305,9 @@ def score_C(
         f"COT index {cot_idx:.1f} → ekstrem {sign_str}; "
         f"raw={raw_score:.3f} (freshness {freshness:.3f} diterapkan ke BOBOT)"
     )
-    logger.debug("score_C[%s]: idx=%.1f, raw=%.3f (fresh→weight=%.3f)", asset, cot_idx, raw_score, freshness)
+    logger.debug(
+        "score_C[%s]: idx=%.1f, raw=%.3f (fresh→weight=%.3f)", asset, cot_idx, raw_score, freshness,
+    )
     return raw_score, detail
 
 
@@ -261,29 +315,34 @@ def score_C(
 # score_D (Retail Sentiment — KONTRARIAN)
 # ---------------------------------------------------------------------------
 
-def score_D(retail: dict[str, Any], asset: str) -> tuple[float, str]:
+def score_D(
+    retail: dict[str, Any],
+    asset: str,
+    *,
+    extreme_hi: int = RETAIL_EXTREME,
+    shape: str = "linear",
+) -> tuple[float, str]:
     """Hitung sub-skor D (Retail Sentiment) untuk satu asset/currency.
 
     KONTRARIAN (dikunci — arsitektur §3.1 & §3.2):
       long_pct_agg tinggi → crowd long → D NEGATIF (fade: bearish bias).
       long_pct_agg rendah → crowd short → D POSITIF (fade: bullish bias).
 
-    Gating RETAIL_EXTREME (default 70):
+    Gating extreme_hi (default 70):
       Aktif hanya kalau:
-        long_pct_agg > RETAIL_EXTREME           (crowd sangat long)
-        long_pct_agg < (100 - RETAIL_EXTREME)   (crowd sangat short)
+        long_pct_agg > extreme_hi           (crowd sangat long)
+        long_pct_agg < (100 - extreme_hi)   (crowd sangat short)
       Di luar rentang → D = 0.
 
     Granularitas (arsitektur §3.2):
       Retail NATIVE per-pair. Untuk currency multi-pair (USD, EUR, dst)
       diperlukan agregasi lintas pair — BELUM diimplementasikan v1.
-      Kalau asset tersedia langsung (XAU, BTC, ETH) → pakai XAUUSD/BTCUSD/ETHUSD.
-      Untuk FX currency → lookup pair paling liquid (EURUSD untuk EUR, dst).
-      Kalau tidak ada data → D=0 + catat.
 
-    Magnitude scale di ekstrem (linear):
-      upper side: long_pct dari RETAIL_EXTREME → 100 di-map ke 0 → -1 (kontrarian short)
-      lower side: long_pct dari (100-RETAIL_EXTREME) → 0 di-map ke 0 → +1 (kontrarian long)
+    Magnitude scale di ekstrem:
+      Linear (default): upper side: long_pct dari extreme_hi → 100 di-map ke 0 → -1
+                        lower side: long_pct dari (100-extreme_hi) → 0 di-map ke 0 → +1
+      Convex (shape="convex"): magnitude = magnitude**2 sebelum diberi tanda.
+        Efek: sinyal lebih lemah di dekat threshold, lebih kuat di ekstrem ekstrem.
 
     Parameters
     ----------
@@ -291,6 +350,12 @@ def score_D(retail: dict[str, Any], asset: str) -> tuple[float, str]:
         Output dari collectors/retail.py sesuai schema §4.
     asset : str
         Currency/aset.
+    extreme_hi : int, keyword-only
+        Threshold long% untuk gating (sisi atas). extreme_lo = 100 - extreme_hi.
+        Default = RETAIL_EXTREME (70). Di-override per profil. PLACEHOLDER.
+    shape : str, keyword-only
+        "linear" (default) atau "convex". Convex = magnitude**2 sebelum tanda.
+        Default "linear" → perilaku tak berubah (backward compat). PLACEHOLDER.
 
     Returns
     -------
@@ -342,31 +407,33 @@ def score_D(retail: dict[str, Any], asset: str) -> tuple[float, str]:
     long_pct = float(long_pct_raw)
 
     # Kalau pair adalah quote-perspective, negate long_pct ke sudut pandang asset
-    # Contoh: EURUSD long%=62 berarti 62% long EUR / 38% long USD
-    #         Untuk USD: long_pct_from_usd_view = 100 - 62 = 38%
     if _PAIR_QUOTE_ASSETS.get(pair_key) == asset:
         long_pct = 100.0 - long_pct
 
-    extreme_hi = float(RETAIL_EXTREME)           # default 70
-    extreme_lo = 100.0 - extreme_hi              # default 30
+    extreme_hi_f = float(extreme_hi)     # mis. 70
+    extreme_lo = 100.0 - extreme_hi_f    # mis. 30
 
     # Gating
-    if extreme_lo <= long_pct <= extreme_hi:
+    if extreme_lo <= long_pct <= extreme_hi_f:
         detail = (
             f"retail {pair_key} long_pct={long_pct:.1f}% "
-            f"(tdk ekstrem, {extreme_lo:.0f}–{extreme_hi:.0f}%) → D=0"
+            f"(tdk ekstrem, {extreme_lo:.0f}–{extreme_hi_f:.0f}%) → D=0"
         )
         return 0.0, detail
 
     # Magnitude scale + kontrarian sign
-    if long_pct > extreme_hi:
+    if long_pct > extreme_hi_f:
         # Crowd sangat long → contrarian short → D negatif
-        magnitude = (long_pct - extreme_hi) / (100.0 - extreme_hi)
+        magnitude = (long_pct - extreme_hi_f) / (100.0 - extreme_hi_f)
+        if shape == "convex":
+            magnitude = magnitude ** 2   # lebih lemah dekat threshold, lebih kuat di ekstrem
         raw_score = -magnitude
         crowd_str = f"long {long_pct:.1f}% → contrarian short"
     else:
         # Crowd sangat short → contrarian long → D positif
         magnitude = (extreme_lo - long_pct) / extreme_lo
+        if shape == "convex":
+            magnitude = magnitude ** 2
         raw_score = +magnitude
         crowd_str = f"long {long_pct:.1f}% (crowd short) → contrarian long"
 
@@ -376,7 +443,7 @@ def score_D(retail: dict[str, Any], asset: str) -> tuple[float, str]:
 
     detail = (
         f"retail {pair_key} {crowd_str}{agreement_str}; "
-        f"score={score:.3f}"
+        f"shape={shape}; score={score:.3f}"
     )
     logger.debug("score_D[%s]: pair=%s, long_pct=%.1f → %.3f", asset, pair_key, long_pct, score)
     return score, detail
@@ -396,6 +463,7 @@ def compute_asset_bias(
     ff_scores: dict[str, dict] | None = None,
     retail_override: dict[str, dict] | None = None,
     enabled: set[str] | None = None,
+    profile: dict | None = None,
 ) -> dict[str, Any]:
     """Hitung bias per satu aset: driver dict + bias_baseline.
 
@@ -415,6 +483,11 @@ def compute_asset_bias(
         Output masing-masing collector sesuai schema §4.
     weights_override : dict, optional
         Override bobot default (untuk crypto, pakai _CRYPTO_WEIGHTS).
+    profile : dict | None, optional
+        Profil tipe trade dari TRADE_PROFILES. Jika None → pakai WEIGHTS default
+        + gating default (BACKWARD COMPAT penuh).
+        Jika diberikan DAN asset FX/XAU → pakai profile["weights"] + gating per-profil.
+        Jika asset crypto → SELALU pakai _CRYPTO_WEIGHTS + gating default (abaikan profile).
 
     Returns
     -------
@@ -424,20 +497,55 @@ def compute_asset_bias(
               "R_hard": {"score": float, "weight": float, "detail": str},
               "C":      {"score": float, "weight": float, "detail": str},
               "D":      {"score": float, "weight": float, "detail": str},
+              "F":      {"score": float, "weight": float, "detail": str},
           },
           "bias_baseline": float,  # ×100, ∈ [-100, 100]
           "active_factors": list[str],
           "weights_used": dict,
         }
     """
-    w = weights_override if weights_override is not None else WEIGHTS
+    is_crypto = asset in ASSETS_CRYPTO
+
+    # --- Tentukan bobot yang dipakai ---
+    # Prioritas: crypto selalu _CRYPTO_WEIGHTS (abaikan profile).
+    # FX/XAU: pakai profile["weights"] kalau profil diberikan, else WEIGHTS default.
+    if is_crypto:
+        w = _CRYPTO_WEIGHTS
+    elif profile is not None:
+        w = profile["weights"]
+    elif weights_override is not None:
+        w = weights_override
+    else:
+        w = WEIGHTS
+
+    # --- Gating params dari profil (hanya untuk FX/XAU) ---
+    carry_deadband_pp = 0.0
+    cot_extreme = COT_EXTREME
+    cot_continuous = False
+    cot_tau = None    # None → pakai default (FRESHNESS_TAU dari config)
+    cot_floor = None  # None → pakai default (FRESHNESS_FLOOR dari config)
+    retail_extreme_hi = RETAIL_EXTREME
+    retail_shape = "linear"
+
+    if profile is not None and not is_crypto:
+        # Carry deadband
+        carry_deadband_pp = float(profile.get("carry", {}).get("deadband_pp", 0.0))
+        # COT gating
+        cot_cfg = profile.get("cot", {})
+        cot_continuous = bool(cot_cfg.get("continuous", False))
+        if not cot_continuous:
+            cot_extreme = cot_cfg.get("extreme", COT_EXTREME)
+        cot_tau = cot_cfg.get("freshness_tau", None)
+        cot_floor = cot_cfg.get("freshness_floor", None)
+        # Retail gating
+        retail_cfg = profile.get("retail", {})
+        retail_extreme_hi = int(retail_cfg.get("extreme_hi", RETAIL_EXTREME))
+        retail_shape = str(retail_cfg.get("shape", "linear"))
 
     # --- Freshness COT ---
     days_since = float(_safe_get(cot, "days_since_snapshot", default=7))
 
     # Price change sejak snapshot: pakai chg_pct × last sebagai proxy nilai absolut
-    # Alternatif: simpan harga snapshot di cot — v1 pakai proxy ini.
-    # Pair harga yang relevan per asset
     _ASSET_TO_PRICE_KEY: dict[str, str] = {
         "EUR": "EURUSD", "GBP": "GBPUSD", "JPY": "USDJPY",
         "AUD": "AUDUSD", "NZD": "NZDUSD", "CAD": "USDCAD",
@@ -446,31 +554,48 @@ def compute_asset_bias(
     }
     price_key = _ASSET_TO_PRICE_KEY.get(asset, "")
     px_data: dict = _safe_get(prices, "prices", price_key, default={})
-    # .get(k, default) mengembalikan None kalau value EKSPLISIT None (bukan default).
-    # Guard: None / non-numeric → 0.0 (jangan crash float(None)).
+
     def _num(v: Any, d: float = 0.0) -> float:
         try:
             return float(v) if v is not None else d
         except (TypeError, ValueError):
             return d
+
     last_price = _num(px_data.get("last"))
     chg_pct = _num(px_data.get("chg_pct"))
     atr14 = _num(px_data.get("atr14"))
 
-    # Price change absolut (proxy: chg_pct/100 × last)
     price_change_abs = abs(chg_pct / 100.0 * last_price) if last_price > 0 else 0.0
 
-    freshness = cot_freshness(days_since, price_change_abs, atr14)
+    # Bangun kwargs freshness berdasarkan profil (kalau ada override)
+    freshness_kwargs: dict = {}
+    if cot_tau is not None:
+        freshness_kwargs["tau"] = float(cot_tau)
+    if cot_floor is not None:
+        freshness_kwargs["floor"] = float(cot_floor)
+
+    freshness = cot_freshness(days_since, price_change_abs, atr14, **freshness_kwargs)
 
     # --- Hitung sub-skor ---
-    r_hard_score, r_hard_detail = score_R_hard(macro, asset)
-    c_score,      c_detail      = score_C(cot, asset, freshness)
+    r_hard_score, r_hard_detail = score_R_hard(
+        macro, asset,
+        carry_deadband_pp=carry_deadband_pp,
+    )
+    c_score, c_detail = score_C(
+        cot, asset, freshness,
+        extreme=cot_extreme,
+        continuous=cot_continuous,
+    )
     # D: pakai override retail A1 kalau tersedia, else score_D (sumber lama)
     if retail_override and asset in retail_override:
         d_score = float(retail_override[asset].get("score", 0.0))
         d_detail = retail_override[asset].get("detail", "retail A1 (kontrarian)")
     else:
-        d_score, d_detail = score_D(retail, asset)
+        d_score, d_detail = score_D(
+            retail, asset,
+            extreme_hi=retail_extreme_hi,
+            shape=retail_shape,
+        )
     # F: ForexFactory surprise (0 kalau kalender FF belum ditarik)
     if ff_scores and asset in ff_scores:
         f_score = float(ff_scores[asset].get("score", 0.0))
@@ -519,7 +644,6 @@ def compute_asset_bias(
     bias_baseline = round(_clamp(raw_bias * 100.0, -100.0, 100.0), 2)
 
     # --- Bangun driver dict ---
-    # Bobot yang "efektif" ditampilkan (nominal; renorm tidak ubah bobot display)
     drivers: dict[str, dict] = {}
     for factor in ["R_hard", "C", "D", "F"]:
         nominal_w = w.get(factor, 0.0)
@@ -554,12 +678,20 @@ def compute_all_assets(
     ff_scores: dict[str, dict] | None = None,
     retail_override: dict[str, dict] | None = None,
     enabled: set[str] | None = None,
+    profile: dict | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Hitung bias untuk semua aset di ASSETS_ALL.
 
-    FX majors + XAU → pakai WEIGHTS default.
-    Crypto (BTC, ETH) → pakai _CRYPTO_WEIGHTS (R_hard turun, C/D naik).
+    FX majors + XAU → pakai WEIGHTS default (atau profile["weights"] kalau profil diberikan).
+    Crypto (BTC, ETH) → SELALU pakai _CRYPTO_WEIGHTS (R_hard turun, C/D naik); profil diabaikan.
     ETH tidak punya COT CME → C akan 0 (graceful).
+
+    Parameters
+    ----------
+    profile : dict | None, optional
+        Profil tipe trade dari TRADE_PROFILES. Kalau None → perilaku identik dengan
+        sebelum perubahan (BACKWARD COMPAT penuh). Kalau diberikan → di-thread ke
+        compute_asset_bias untuk setiap aset FX/XAU.
 
     Returns
     -------
@@ -570,6 +702,7 @@ def compute_all_assets(
 
     for asset in ASSETS_ALL:
         is_crypto = asset in ASSETS_CRYPTO
+        # Crypto: selalu _CRYPTO_WEIGHTS, abaikan profile (lihat compute_asset_bias)
         w_override = _CRYPTO_WEIGHTS if is_crypto else None
 
         try:
@@ -583,6 +716,7 @@ def compute_all_assets(
                 ff_scores=ff_scores,
                 retail_override=retail_override,
                 enabled=enabled,
+                profile=profile,
             )
         except Exception as exc:
             logger.error("compute_asset_bias[%s] gagal: %s", asset, exc, exc_info=True)
