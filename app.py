@@ -488,6 +488,35 @@ _FACTOR_NAMES = {"R_hard": "Rate diff", "C": "COT", "D": "Retail", "F": "FF surp
                  "R_narrative": "News"}
 
 
+def _ff_event_key(e: dict) -> str:
+    """Identitas unik event FF untuk dedup. Pakai id kalau ada, else date|time|ccy|name."""
+    eid = e.get("id")
+    if eid not in (None, "", 0):
+        return f"id:{eid}"
+    return (
+        f"{e.get('date','')}|{e.get('time','')}|"
+        f"{(e.get('currency') or '').upper()}|{e.get('name','')}"
+    )
+
+
+def _merge_ff_events(existing: list[dict] | None, new: list[dict] | None) -> list[dict]:
+    """Gabung dua batch event FF (mis. minggu ini + minggu lalu), dedup by key.
+
+    Event `new` menimpa `existing` pada key sama (actual lebih fresh menang).
+    Dipakai supaya tarik 'minggu ini' TIDAK menghapus 'minggu lalu' — rilis Kamis/
+    Jumat lalu tetap ada & ikut dihitung faktor F (dengan freshness decay otomatis;
+    event yang sudah basi mendekati 0, jadi aman digabung).
+    """
+    by_key: dict[str, dict] = {}
+    for e in (existing or []):
+        if isinstance(e, dict):
+            by_key[_ff_event_key(e)] = e
+    for e in (new or []):
+        if isinstance(e, dict):
+            by_key[_ff_event_key(e)] = e
+    return list(by_key.values())
+
+
 def _chip(score: float, scale100: bool = True) -> str:
     """Pill skor berwarna. score dalam −100..100 (scale100) atau −1..1."""
     v = score if scale100 else score * 100
@@ -1983,14 +2012,36 @@ def render_risk_events_ff(calendar_data: dict) -> None:
     st.subheader("⏰ Risk Events — ForexFactory")
     st.caption("Acuan event + **actual** dari ForexFactory (via parse.bot). Surprise rilis → faktor **F** "
                "di Currency Power (z×polaritas×impact×freshness). Tarik = 1 call (cache 6 jam).")
-    if st.button("🔄 Tarik / refresh kalender FF (minggu ini)", key="re_ff_fetch", disabled=not has_key):
-        try:
-            with st.spinner("…"):
-                st.session_state["pb_ff_data"] = pb.parse_ff_calendar(
-                    pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600))
-                st.session_state["pb_ff_ts"] = _now_wib_str()
-        except Exception as exc:
-            st.error(f"FF: {exc}")
+    _ffc1, _ffc2, _ffc3 = st.columns([2, 2, 1])
+    with _ffc1:
+        if st.button("🔄 Tarik minggu ini", key="re_ff_fetch", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    _new = pb.parse_ff_calendar(
+                        pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600))
+                    st.session_state["pb_ff_data"] = _merge_ff_events(
+                        st.session_state.get("pb_ff_data"), _new)
+                    st.session_state["pb_ff_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"FF: {exc}")
+    with _ffc2:
+        if st.button("⏮️ Tarik minggu lalu", key="re_ff_fetch_last", disabled=not has_key,
+                     help="Awal minggu: rilis Kamis/Jumat lalu masih berimpact (freshness). Digabung, bukan menimpa."):
+            try:
+                with st.spinner("…"):
+                    _newl = pb.parse_ff_calendar(
+                        pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {"week": "last"}, ttl=21_600))
+                    st.session_state["pb_ff_data"] = _merge_ff_events(
+                        st.session_state.get("pb_ff_data"), _newl)
+                    st.session_state["pb_ff_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"FF (minggu lalu): {exc}")
+    with _ffc3:
+        if st.button("🗑️ Reset", key="re_ff_reset", help="Kosongkan data FF."):
+            st.session_state["pb_ff_data"] = []
+            st.session_state.pop("pb_ff_ts", None)
+    st.caption("⏮️ 'Minggu lalu' = 1 call terpisah (digabung & dedup). Butuh scraper parse.bot "
+               "menerima param `week=last`; kalau hasilnya sama dgn minggu ini, scraper perlu input `week`/`url`.")
     if not has_key:
         st.warning("Set `PARSE_API_KEY` di Secrets untuk tarik FF.")
     ff = st.session_state.get("pb_ff_data")
@@ -2057,16 +2108,30 @@ def render_data_feeds() -> None:
     )
     st.divider()
 
-    # --- 1) ForexFactory: kalender minggu ini (actual/forecast/previous) ---
-    st.markdown("**📅 Kalender ForexFactory (minggu ini)** — 1 call = seluruh minggu. Cache 6 jam.")
-    if st.button("Tarik kalender minggu ini", key="pb_ff", disabled=not has_key):
-        try:
-            with st.spinner("Mengambil kalender FF…"):
-                resp = pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600)
-            st.session_state["pb_ff_data"] = pb.parse_ff_calendar(resp)
-            st.session_state["pb_ff_ts"] = _now_wib_str()
-        except Exception as exc:
-            st.error(f"FF gagal: {exc}")
+    # --- 1) ForexFactory: kalender (actual/forecast/previous) ---
+    st.markdown("**📅 Kalender ForexFactory** — 1 call = seluruh minggu. Cache 6 jam. "
+                "Tarik **minggu lalu** di awal minggu agar rilis Kamis/Jumat lalu tetap dihitung F.")
+    _pbc1, _pbc2 = st.columns(2)
+    with _pbc1:
+        if st.button("Tarik minggu ini", key="pb_ff", disabled=not has_key):
+            try:
+                with st.spinner("Mengambil kalender FF…"):
+                    resp = pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600)
+                st.session_state["pb_ff_data"] = _merge_ff_events(
+                    st.session_state.get("pb_ff_data"), pb.parse_ff_calendar(resp))
+                st.session_state["pb_ff_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"FF gagal: {exc}")
+    with _pbc2:
+        if st.button("Tarik minggu lalu", key="pb_ff_last", disabled=not has_key):
+            try:
+                with st.spinner("Mengambil kalender FF minggu lalu…"):
+                    resp_l = pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {"week": "last"}, ttl=21_600)
+                st.session_state["pb_ff_data"] = _merge_ff_events(
+                    st.session_state.get("pb_ff_data"), pb.parse_ff_calendar(resp_l))
+                st.session_state["pb_ff_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"FF minggu lalu gagal: {exc}")
     ff = st.session_state.get("pb_ff_data")
     if ff:
         _render_ff_calendar(ff, st.session_state.get("pb_ff_ts", "-"))
