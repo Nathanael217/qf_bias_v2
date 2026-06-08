@@ -290,14 +290,33 @@ def cached_get_eu_actuals() -> dict:
 
 
 @st.cache_data(ttl=TTL["news_overlay"], show_spinner=False)
-def cached_compute_news_delta(headlines_json: str, override_json: str = "") -> tuple[dict, list]:
+def cached_compute_news_delta(
+    headlines_json: str,
+    override_json: str = "",
+    *,
+    cap: float = 30.0,
+    decay_min: float = 120.0,
+    min_impact: str = "med",
+) -> tuple[dict, list]:
     """Cache news_overlay (proses mahal). Terima json string utk hashability.
-    override_json: peta {event_title: {scores, impact}} dari Groq (kosong = keyword)."""
+
+    override_json: peta {event_title: {scores, impact}} dari Groq (kosong = keyword).
+    cap/decay_min/min_impact: dari profil tipe trade aktif (multi-timeframe overlay).
+      - min_impact: filter ketat dampak-pasar (engine/news_filter) — buang noise dulu.
+      - cap/decay_min: batas & half-life per horizon (session pendek, weekly panjang).
+    """
     import json
     try:
         headlines = json.loads(headlines_json) if headlines_json else []
         override = json.loads(override_json) if override_json else None
-        return compute_news_delta(headlines, direction_override=override)
+        # Filter ketat dulu: hanya headline berdampak-pasar yang lolos ke scoring.
+        try:
+            from engine.news_filter import filter_headlines
+            headlines = filter_headlines(headlines, min_impact=min_impact)
+        except Exception as exc:
+            logger.warning("news_filter gagal (lanjut tanpa filter): %s", exc)
+        return compute_news_delta(headlines, direction_override=override,
+                                  cap=cap, decay_min=decay_min)
     except Exception as exc:
         logger.error("compute_news_delta() exception: %s", exc)
         return {}, []
@@ -573,6 +592,68 @@ def _asset_card_html(asset: str, group: str, score: float, label: str, conf: flo
         f'{_pressure(score)}'
         f'<div class="qf-meta"><span>{meta_l}</span>{meta_r}</div>'
         f'{drv_block}</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# EVENT-RISK GATING (#1) — peringatan event high-impact yang akan datang
+# ---------------------------------------------------------------------------
+
+# Lookahead per profil (jam): horizon trade menentukan seberapa jauh ke depan
+# sebuah event dianggap "mengancam" entry. PLACEHOLDER.
+_PROFILE_RISK_LOOKAHEAD_H: dict[str, float] = {
+    "session": 6.0, "intraday": 12.0, "swing": 72.0, "swing_weekly": 336.0,
+}
+_IMPACT_RANK_CAL = {"HIGH": 3, "MED": 2, "MEDIUM": 2, "LOW": 1}
+
+
+def upcoming_event_risk(events, now_dt, lookahead_h: float, impact_min: str = "HIGH"):
+    """Event high-impact yang AKAN datang dalam lookahead_h jam (status=upcoming).
+
+    Return list {ccy, name, hours_until, impact} urut paling dekat. Murni &
+    deterministik. TIDAK mempengaruhi scoring — hanya peringatan timing.
+    """
+    from datetime import datetime as _dt
+    out = []
+    min_rank = _IMPACT_RANK_CAL.get(str(impact_min).upper(), 3)
+    for e in events or []:
+        if not isinstance(e, dict) or e.get("status") != "upcoming":
+            continue
+        if _IMPACT_RANK_CAL.get((e.get("impact") or "").upper(), 0) < min_rank:
+            continue
+        ts = e.get("ts_utc") or ""
+        try:
+            ev = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+            hrs = (ev - now_dt).total_seconds() / 3600.0
+        except Exception:
+            continue
+        if 0.0 <= hrs <= lookahead_h:
+            out.append({
+                "ccy": (e.get("currency") or "").upper(),
+                "name": e.get("name", ""),
+                "hours_until": round(hrs, 1),
+                "impact": (e.get("impact") or "").upper(),
+            })
+    out.sort(key=lambda x: x["hours_until"])
+    return out
+
+
+def render_event_risk_banner(calendar_data: dict, profile_name: str, now_dt) -> None:
+    """Banner peringatan event high-impact menjelang rilis (horizon-aware per profil)."""
+    look = _PROFILE_RISK_LOOKAHEAD_H.get(profile_name, 12.0)
+    try:
+        risks = upcoming_event_risk(
+            calendar_data.get("events", []), now_dt, look, impact_min="HIGH")
+    except Exception:
+        return
+    if not risks:
+        return
+    items = " · ".join(
+        f"**{r['ccy']}** {r['name']} (~{r['hours_until']:.1f}j)" for r in risks[:5])
+    more = f" +{len(risks) - 5} lagi" if len(risks) > 5 else ""
+    st.warning(
+        f"⚠ **Event risk ≤{look:.0f}j:** {items}{more} — hindari entry baru menjelang "
+        f"rilis; ekspektasi volatilitas. (TA tetap acuan; ini peringatan timing, bukan sinyal.)"
     )
 
 
@@ -2482,7 +2563,12 @@ def main() -> None:
             if use_groq:
                 _override, _groq_diag = build_groq_override(headlines)
                 override_json = json.dumps(_override) if _override else ""
-            news_delta_map, news_clusters = cached_compute_news_delta(headlines_json, override_json)
+            news_delta_map, news_clusters = cached_compute_news_delta(
+                headlines_json, override_json,
+                cap=float(active_profile.get("news", {}).get("cap", 30.0)),
+                decay_min=float(active_profile.get("news", {}).get("half_life_min", 120.0)) / 0.6931,
+                min_impact=active_profile.get("news", {}).get("min_impact", "med"),
+            )
         except Exception as exc:
             logger.error("compute_news_delta gagal: %s", exc)
             news_delta_map = {}
@@ -2537,6 +2623,10 @@ def main() -> None:
     ])
 
     with tab_board:
+        try:
+            render_event_risk_banner(calendar_data, _sel, now_utc())
+        except Exception as exc:
+            logger.debug("event-risk banner skip: %s", exc)
         try:
             render_bias_board(asset_bias_map, news_delta_map, show_overlay)
         except Exception as exc:
