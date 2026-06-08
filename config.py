@@ -103,6 +103,7 @@ TRADE_PROFILES: dict[str, dict] = {
         "cot":      {"extreme": (10, 90), "freshness_tau": 3.0, "freshness_floor": 0.0},  # PLACEHOLDER
         "retail":   {"extreme_hi": 65, "shape": "convex"},                 # PLACEHOLDER
         "surprise": {"impact_min": "medium", "freshness_tau": 1.0},       # PLACEHOLDER
+        "news":     {"half_life_min": 45,   "cap": 18, "min_impact": "med"},   # PLACEHOLDER
     },
     "intraday": {
         "label": "Intraday (8-12 jam)",
@@ -111,6 +112,7 @@ TRADE_PROFILES: dict[str, dict] = {
         "cot":      {"extreme": (12, 88), "freshness_tau": 4.0, "freshness_floor": 0.10},  # PLACEHOLDER
         "retail":   {"extreme_hi": 68, "shape": "convex"},                 # PLACEHOLDER
         "surprise": {"impact_min": "medium", "freshness_tau": 1.5},       # PLACEHOLDER
+        "news":     {"half_life_min": 150,  "cap": 12, "min_impact": "med"},   # PLACEHOLDER
     },
     "swing": {
         "label": "Swing (2-3 hari)",
@@ -119,6 +121,7 @@ TRADE_PROFILES: dict[str, dict] = {
         "cot":      {"extreme": (25, 75), "freshness_tau": 6.0, "freshness_floor": 0.25},  # PLACEHOLDER
         "retail":   {"extreme_hi": 75, "shape": "linear"},                 # PLACEHOLDER
         "surprise": {"impact_min": "high", "freshness_tau": 2.0},         # PLACEHOLDER
+        "news":     {"half_life_min": 480,  "cap": 8,  "min_impact": "high"},  # PLACEHOLDER
     },
     "swing_weekly": {
         "label": "Swing Weekly (1-2 minggu)",
@@ -127,6 +130,7 @@ TRADE_PROFILES: dict[str, dict] = {
         "cot":      {"continuous": True, "freshness_tau": 8.0, "freshness_floor": 0.25},  # PLACEHOLDER
         "retail":   {"extreme_hi": 80, "shape": "linear"},                 # PLACEHOLDER
         "surprise": {"impact_min": "high", "freshness_tau": 1.5},         # PLACEHOLDER
+        "news":     {"half_life_min": 1440, "cap": 4,  "min_impact": "high"},  # PLACEHOLDER
     },
 }
 """
