@@ -440,21 +440,22 @@ def magnitude(cluster: ClusterResult) -> float:
 # STEP 4 — TIME DECAY
 # ---------------------------------------------------------------------------
 
-def time_decay(age_min: float) -> float:
+def time_decay(age_min: float, decay_min: float = NEWS_DECAY_MIN) -> float:
     """
     Decay eksponensial berdasarkan umur event.
 
-    Formula: exp(-age_min / NEWS_DECAY_MIN)
-    NEWS_DECAY_MIN = 120.0 menit (PLACEHOLDER dari config).
+    Formula: exp(-age_min / decay_min)
+    decay_min default = NEWS_DECAY_MIN (120 mnt). PLACEHOLDER — di-override
+    per profil tipe trade (session pendek, swing/weekly panjang).
 
-    Contoh nilai:
+    Contoh nilai (decay_min=120):
         age=0   → 1.000
         age=60  → 0.607
         age=120 → 0.368  (half-life ≈ 83 mnt)
         age=240 → 0.135
         age=480 → 0.018  (~8 jam sudah hampir nol)
     """
-    return math.exp(-age_min / NEWS_DECAY_MIN)
+    return math.exp(-age_min / max(1e-6, decay_min))
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +468,9 @@ def compute_news_delta(
     window_minutes: float = 30.0,
     now_utc: datetime | None = None,
     direction_override: dict[str, dict] | None = None,
+    *,
+    cap: float = NEWS_CAP,
+    decay_min: float = NEWS_DECAY_MIN,
 ) -> tuple[dict[str, float], list[NewsClusterDisplay]]:
     """
     Pipeline lengkap: headlines → delta per asset + display clusters.
@@ -516,7 +520,7 @@ def compute_news_delta(
             cl_impact = ""
             cl_source = "keyword"
         mag = magnitude(cluster)
-        decay = time_decay(cluster["age_min"])
+        decay = time_decay(cluster["age_min"], decay_min)
         weight = mag * decay  # kontribusi event ini
 
         direction_display: dict[str, str] = {}
@@ -558,7 +562,7 @@ def compute_news_delta(
     news_delta: dict[str, float] = {}
     for asset, raw in raw_delta.items():
         scaled = raw * SCALE_FACTOR
-        news_delta[asset] = round(max(-NEWS_CAP, min(NEWS_CAP, scaled)), 4)
+        news_delta[asset] = round(max(-cap, min(cap, scaled)), 4)
 
     return news_delta, display_clusters
 
