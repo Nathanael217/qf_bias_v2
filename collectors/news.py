@@ -78,10 +78,15 @@ _FEEDS: list[tuple[str, str]] = [
     ("FinancialJuice", _FINANCIALJUICE_RSS_URL),
     ("Fed",            "https://www.federalreserve.gov/feeds/press_monetary.xml"),
     ("ForexLive",      "https://www.forexlive.com/feed"),
+    # Trump tracker — RSS resmi arsip Truth Social (Defending Democracy Together).
+    # Volume tinggi & banyak noise → di-filter ketat oleh engine/news_filter
+    # (item Trump WAJIB ada kata-kunci aksi/policy market).
+    ("Trump",          "https://www.trumpstruth.org/feed"),
 ]
 # Fallback raw_category bila feed tidak menyertakan tag kategori (mis. Fed press release).
 _FEED_DEFAULT_CATEGORY: dict[str, str] = {
     "Fed": "CENTRAL_BANK",
+    "Trump": "POLITICS",
 }
 
 _MAX_HEADLINES: int = 80
@@ -298,6 +303,20 @@ def get_news(max_headlines: int = _MAX_HEADLINES) -> dict:
             logger.warning("get_news: %s gagal: %s (lanjut feed lain)", source_name, exc)
 
     # Urutkan terbaru dulu, lalu cap total
+    # --- Sumber TAMBAHAN: channel Telegram publik (OFF default; guarded) ------
+    # Aktif hanya bila telegram_news.TELEGRAM_CHANNELS diisi. Gagal/kosong → no-op.
+    try:
+        from collectors import telegram_news as _tg
+        if _tg.TELEGRAM_CHANNELS:
+            tg_items = _tg.get_telegram_news()
+            for it in tg_items:
+                # ts_wib opsional; clustering hanya butuh ts_utc.
+                headlines.append(it)
+            if tg_items:
+                sources_ok.append(f"Telegram({len(_tg.TELEGRAM_CHANNELS)})")
+    except Exception as exc:  # modul tak ada / error → abaikan, jangan matikan news
+        logger.debug("telegram_news skip: %s", exc)
+
     headlines.sort(key=lambda h: h["ts_utc"], reverse=True)
     headlines = headlines[:max_headlines]
 
