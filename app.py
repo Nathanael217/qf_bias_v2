@@ -554,8 +554,51 @@ def _vcls(v: float) -> str:
     return "qf-pos" if v > 0.0005 else ("qf-neg" if v < -0.0005 else "qf-neu")
 
 
+def _esc(s: str) -> str:
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _news_brief_for_asset(asset: str, clusters: list | None, max_items: int = 2) -> str:
+    """Brief penjelasan news yang memberi +/− ke aset ini (saat overlay aktif).
+
+    Ambil cluster yang arahnya ≠ 0 untuk aset ini, urut magnitude, tampilkan
+    top `max_items` dengan panah (▲ bullish / ▼ bearish) + impact tag.
+    """
+    if not clusters:
+        return ""
+    rel = []
+    for c in clusters or []:
+        if not isinstance(c, dict):
+            continue
+        d = (c.get("direction") or {}).get(asset, "0")
+        if d in ("+", "-"):
+            rel.append((c.get("magnitude", 0.0), d, c.get("event", ""), c.get("impact", "")))
+    if not rel:
+        return ""
+    rel.sort(key=lambda x: x[0], reverse=True)
+    items = []
+    for mag, d, ev, imp in rel[:max_items]:
+        arrow = "▲" if d == "+" else "▼"
+        cls = _vcls(1.0 if d == "+" else -1.0)
+        ev_short = _esc(ev[:80] + ("…" if len(ev) > 80 else ""))
+        tag = f" <span style=\"opacity:.6\">({_esc(imp)})</span>" if imp else ""
+        items.append(
+            f'<div style="font-size:.78em;line-height:1.25;margin-top:2px">'
+            f'<span class="{cls}">{arrow}</span> {ev_short}{tag}</div>'
+        )
+    extra = ""
+    if len(rel) > max_items:
+        extra = (f'<div style="font-size:.72em;opacity:.55;margin-top:1px">'
+                 f'+{len(rel) - max_items} berita lain</div>')
+    return ('<div style="margin-top:5px;padding-top:4px;border-top:1px solid '
+            'rgba(255,255,255,.06)"><div style="font-size:.7em;opacity:.55;'
+            'text-transform:uppercase;letter-spacing:.04em">News pendorong</div>'
+            + "".join(items) + extra + '</div>')
+
+
 def _asset_card_html(asset: str, group: str, score: float, label: str, conf: float,
-                     drivers: dict, delta: float = 0.0, show_overlay: bool = False) -> str:
+                     drivers: dict, delta: float = 0.0, show_overlay: bool = False,
+                     news_brief: str = "") -> str:
     """Kartu aset metavulus (self-contained) — driver selalu tampil & terbaca."""
     chip = _chip(score)
     lab_cls = _vcls(score / 100.0)
@@ -564,6 +607,9 @@ def _asset_card_html(asset: str, group: str, score: float, label: str, conf: flo
     if show_overlay and abs(delta) > 0.1:
         dd = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
         meta_r = f'<span class="{_vcls(delta)}">Δnews {dd}</span>'
+    brief_html = ""
+    if show_overlay and news_brief:
+        brief_html = news_brief
     drv_html = ""
     for f, fd in (drivers or {}).items():
         fs = fd.get("score", 0.0)
@@ -591,6 +637,7 @@ def _asset_card_html(asset: str, group: str, score: float, label: str, conf: flo
         f'<div class="qf-label {lab_cls}">{label}</div>'
         f'{_pressure(score)}'
         f'<div class="qf-meta"><span>{meta_l}</span>{meta_r}</div>'
+        f'{brief_html}'
         f'{drv_block}</div>'
     )
 
@@ -661,6 +708,7 @@ def render_bias_board(
     asset_data: dict[str, dict],
     news_delta: dict[str, float],
     show_overlay: bool,
+    news_clusters: list | None = None,
 ) -> None:
     """Render grid kartu per aset dengan bar skor, label, confidence, driver breakdown."""
 
@@ -698,9 +746,11 @@ def render_bias_board(
                 label = bias_label(score)
                 conf = data.get("confidence", 0.0) or 0.0
                 drivers = data.get("drivers", {})
+                brief = _news_brief_for_asset(asset, news_clusters) if show_overlay else ""
                 with col:
                     st.markdown(
-                        _asset_card_html(asset, micro, score, label, conf, drivers, delta, show_overlay),
+                        _asset_card_html(asset, micro, score, label, conf, drivers,
+                                         delta, show_overlay, brief),
                         unsafe_allow_html=True,
                     )
 
@@ -2628,7 +2678,7 @@ def main() -> None:
         except Exception as exc:
             logger.debug("event-risk banner skip: %s", exc)
         try:
-            render_bias_board(asset_bias_map, news_delta_map, show_overlay)
+            render_bias_board(asset_bias_map, news_delta_map, show_overlay, news_clusters)
         except Exception as exc:
             st.error(f"Bias Board error: {exc}")
 
