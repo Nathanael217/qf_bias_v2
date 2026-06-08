@@ -75,6 +75,24 @@ Lihat arsitektur §3 Crypto. ⚠ SEMUA = PLACEHOLDER.
 
 
 # ---------------------------------------------------------------------------
+# R_COMMODITY — pengganti carry/rate-diff untuk komoditas (emas). PLACEHOLDER.
+# ---------------------------------------------------------------------------
+# Komoditas tidak punya rate differential. Emas digerakkan dua kanal makro
+# terukur, KEDUANYA inverse:
+#   - real yield 10y (FRED DFII10): real yield NAIK → emas TURUN (opportunity cost).
+#   - DXY (USD): USD NAIK → emas TURUN (emas dihargai USD).
+# Hanya XAU yang aktif: XAG/USOIL belum ada feed retail(A1)/COT, jadi di-skip
+# (sesuai keputusan). Tinggal tambah koefisien di sini saat datanya tersedia.
+_R_COMMODITY_SCALE: float = 0.70   # PLACEHOLDER — skala R_commodity → [-1,1]
+_RY_BAND_PP: float = 0.50          # PLACEHOLDER — |Δ real yield 10y (pp, ~20 hari)| → ±1
+_DXY_BAND_PCT: float = 0.50        # PLACEHOLDER — |DXY chg_pct| → ±1
+_R_COMMODITY_COEFFS: dict[str, dict[str, float]] = {
+    "XAU": {"ry": 0.65, "dxy": 0.35},   # emas: real yield primer, USD sekunder. PLACEHOLDER.
+    # "XAG": {...}, "USOIL": {...}  → tambah saat feed retail/COT tersedia.
+}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -188,6 +206,67 @@ def score_R_hard(
 
     detail = f"{diff_detail} → R_hard(carry)={score:.3f}"
     logger.debug("score_R_hard[%s]: diff_norm=%.3f → %.3f", asset, diff_norm, score)
+    return score, detail
+
+
+# ---------------------------------------------------------------------------
+# score_R_commodity (R-equivalent untuk komoditas / emas)
+# ---------------------------------------------------------------------------
+
+def score_R_commodity(
+    macro: dict[str, Any],
+    prices: dict[str, Any],
+    asset: str,
+    *,
+    scale: float = _R_COMMODITY_SCALE,
+) -> tuple[float, str]:
+    """R-equivalent untuk komoditas — pengganti carry (rate-diff tak berlaku di emas).
+
+    Emas digerakkan dua kanal makro terukur, KEDUANYA inverse:
+      - real yield 10y (macro["real_yield"]["change_20d"], dari FRED DFII10):
+        real yield NAIK → emas TURUN (opportunity cost naik).
+      - DXY (prices["prices"]["DXY"]["chg_pct"]): USD NAIK → emas TURUN.
+
+    R = clamp(c_ry·sinyal_ry + c_dxy·sinyal_dxy, -1, 1) × scale.
+    Koefisien per-aset di _R_COMMODITY_COEFFS (hanya XAU aktif saat ini).
+
+    Graceful: salah satu kanal datanya hilang → kanal itu = 0 (kontribusi berkurang,
+    bukan crash). Dua-duanya hilang → R = 0.
+    """
+    coeffs = _R_COMMODITY_COEFFS.get(asset)
+    if coeffs is None:
+        return 0.0, f"{asset}: tak ada koefisien R_commodity → 0"
+
+    # --- Kanal real yield (inverse) ---
+    ry = _safe_get(macro, "real_yield", default={}) or {}
+    ry_change = ry.get("change_20d")
+    ry_signal = 0.0
+    ry_txt = "real yield n/a"
+    if ry_change is not None:
+        try:
+            ry_signal = _clamp(-float(ry_change) / _RY_BAND_PP, -1.0, 1.0)
+            ry_txt = f"Δreal_yield {float(ry_change):+.2f}pp → {ry_signal:+.2f}"
+        except (TypeError, ValueError):
+            ry_signal = 0.0
+            ry_txt = "real yield invalid"
+
+    # --- Kanal DXY (inverse) ---
+    dxy = _safe_get(prices, "prices", "DXY", default={}) or {}
+    dxy_chg = dxy.get("chg_pct")
+    dxy_signal = 0.0
+    dxy_txt = "DXY n/a"
+    if dxy_chg is not None:
+        try:
+            dxy_signal = _clamp(-float(dxy_chg) / _DXY_BAND_PCT, -1.0, 1.0)
+            dxy_txt = f"DXY {float(dxy_chg):+.2f}% → {dxy_signal:+.2f}"
+        except (TypeError, ValueError):
+            dxy_signal = 0.0
+            dxy_txt = "DXY invalid"
+
+    raw = coeffs["ry"] * ry_signal + coeffs["dxy"] * dxy_signal
+    score = _clamp(raw * scale, -1.0, 1.0)
+    detail = f"{ry_txt} + {dxy_txt} → R_{asset.lower()}(makro)={score:.3f}"
+    logger.debug("score_R_commodity[%s]: ry=%.3f dxy=%.3f → %.3f", asset, ry_signal, dxy_signal, score)
     return score, detail
 
 
@@ -577,10 +656,16 @@ def compute_asset_bias(
     freshness = cot_freshness(days_since, price_change_abs, atr14, **freshness_kwargs)
 
     # --- Hitung sub-skor ---
-    r_hard_score, r_hard_detail = score_R_hard(
-        macro, asset,
-        carry_deadband_pp=carry_deadband_pp,
-    )
+    # R slot: komoditas (emas) pakai real yield + DXY (rate-diff tak berlaku);
+    # FX/crypto tetap carry (score_R_hard). carry_deadband hanya relevan untuk FX.
+    is_commodity = (asset == ASSET_GOLD)
+    if is_commodity:
+        r_hard_score, r_hard_detail = score_R_commodity(macro, prices, asset)
+    else:
+        r_hard_score, r_hard_detail = score_R_hard(
+            macro, asset,
+            carry_deadband_pp=carry_deadband_pp,
+        )
     c_score, c_detail = score_C(
         cot, asset, freshness,
         extreme=cot_extreme,
