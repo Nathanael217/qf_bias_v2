@@ -206,6 +206,72 @@ def _fetch_fred_latest(
 
 
 # ---------------------------------------------------------------------------
+# Real yield 10y (DFII10) — untuk R komoditas (emas). Tahan-banting (tak pernah raise).
+# ---------------------------------------------------------------------------
+
+_REAL_YIELD_SERIES: str = "DFII10"   # 10y TIPS real yield (FRED)
+_REAL_YIELD_WINDOW: int = 20         # obs (~1 bulan dagang) untuk hitung perubahan
+
+
+def _fetch_fred_real_yield(
+    api_key: str,
+    session: requests.Session,
+    retries: int = _FRED_RETRIES,
+) -> dict[str, float] | None:
+    """Fetch DFII10 (real yield 10y) + perubahan ~20 obs.
+
+    Return {"value": latest, "change_20d": latest - past} atau None.
+    Tahan-banting: error apa pun → None (TIDAK pernah raise), supaya get_macro
+    tetap mengembalikan hasil meski fetch ini gagal.
+    """
+    params = {
+        "series_id": _REAL_YIELD_SERIES,
+        "api_key": api_key,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": 60,
+        "observation_start": "2020-01-01",
+    }
+    attempt = 0
+    while attempt <= retries:
+        try:
+            resp = session.get(_FRED_BASE_URL, params=params, timeout=_FRED_TIMEOUT)
+            resp.raise_for_status()
+            obs = resp.json().get("observations", [])
+            vals: list[float] = []
+            for o in obs:
+                v = o.get("value", ".")
+                if v != ".":
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            if not vals:
+                logger.warning("FRED %s: tak ada obs valid", _REAL_YIELD_SERIES)
+                return None
+            latest = vals[0]
+            past = vals[min(_REAL_YIELD_WINDOW, len(vals) - 1)]
+            return {"value": round(latest, 3), "change_20d": round(latest - past, 3)}
+        except requests.exceptions.Timeout:
+            logger.warning("FRED %s timeout (attempt %d)", _REAL_YIELD_SERIES, attempt + 1)
+        except requests.exceptions.HTTPError as exc:
+            code = getattr(exc.response, "status_code", None)
+            if code == 429:
+                time.sleep(2.0)
+                attempt += 1
+                continue
+            logger.error("FRED %s HTTP error: %s", _REAL_YIELD_SERIES, exc)
+            return None
+        except Exception as exc:
+            logger.error("FRED %s unexpected error: %s", _REAL_YIELD_SERIES, exc)
+            return None
+        attempt += 1
+        if attempt <= retries:
+            time.sleep(1.0)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Rate differential helper
 # ---------------------------------------------------------------------------
 
@@ -365,6 +431,7 @@ def get_macro(
         result["rates"] = {ccy: None for ccy in _FRED_SERIES}
         result["rate_diff"] = _compute_rate_diffs(result["rates"])
         result["surprises"] = build_surprises(calendar_events or [])
+        result["real_yield"] = None
         return result
 
     # --- Fetch rates from FRED ------------------------------------------------
@@ -402,6 +469,13 @@ def get_macro(
 
     # --- Surprises (from caller-provided calendar data) -----------------------
     result["surprises"] = build_surprises(calendar_events or [])
+
+    # --- Real yield 10y (untuk R komoditas / emas) — tahan-banting -----------
+    try:
+        result["real_yield"] = _fetch_fred_real_yield(api_key, session)
+    except Exception as exc:
+        logger.error("real_yield fetch gagal (diabaikan): %s", exc)
+        result["real_yield"] = None
 
     logger.info(
         "get_macro() done — rates OK: %d, failed: %d",
