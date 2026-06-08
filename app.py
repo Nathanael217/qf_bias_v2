@@ -527,6 +527,8 @@ def _asset_card_html(asset: str, group: str, score: float, label: str, conf: flo
         det_lines = [p.strip() for p in det.split("\n") if p.strip()]
         det_html = "<br>".join(det_lines) if det_lines else "–"
         nm = _FACTOR_NAMES.get(f, f)
+        if f == "R_hard" and asset == ASSET_GOLD:
+            nm = "Makro (yield+DXY)"
         drv_html += (
             f'<div class="qf-drv-row"><span class="qf-drv-name">{nm} '
             f'<span class="qf-drv-w">w{fw:.2f}</span></span>'
