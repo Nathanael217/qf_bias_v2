@@ -33,8 +33,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Aktifkan dengan menambah handle (tanpa @). KOSONG = fitur OFF (default aman).
-TELEGRAM_CHANNELS: list[str] = []
+# Aktifkan dengan menambah handle (tanpa @). KOSONG = fitur OFF.
+# Default: 2 channel terverifikasi. Kalau app terasa lambat / TG kosong di
+# deploy-mu (t.me/s bisa diblok/lambat dari Streamlit Cloud), kosongkan list ini.
+TELEGRAM_CHANNELS: list[str] = ["WalterBloomberg", "FirstSquawk"]
 
 # Kandidat (referensi; pindahkan ke TELEGRAM_CHANNELS untuk mengaktifkan).
 CANDIDATE_CHANNELS: dict[str, str] = {
@@ -44,7 +46,7 @@ CANDIDATE_CHANNELS: dict[str, str] = {
 }
 
 _BASE = "https://t.me/s/"
-_TIMEOUT = 10
+_TIMEOUT = 6
 _MAX_PER_CHANNEL = 20
 
 _MSG_TEXT_RE = re.compile(
